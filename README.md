@@ -37,7 +37,13 @@ kepler daemon
 
 The TUI supports multiline editing, model and theme selection, queued prompts, compact tool output, session metrics, and terminal scrollback. Run `/help` for commands and keys. Run `/quit` to detach without stopping the session.
 
-Kepler will not run shell tools when the required sandbox is unavailable.
+Kepler will not run shell tools when the required sandbox is unavailable. To opt out explicitly, start a separate unsafe daemon and session with:
+
+```bash
+kepler --unsafe
+```
+
+Unsafe mode disables operating-system isolation and file-tool path policy. Shell commands, MCP stdio servers, reads, and edits run with the user's full host access. Kepler stores unsafe sessions separately under `~/.kepler/unsafe/`, records the unenforced sandbox state, and keeps a warning visible in the terminal client.
 
 ## Packages
 

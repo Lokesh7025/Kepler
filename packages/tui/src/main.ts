@@ -27,13 +27,18 @@ import { loadMcpConfig, McpManager, mcpSecretValues } from "@kepler/extension-mc
 import { discoverSkills, makeSkillTool, skillCatalogSection } from "@kepler/extension-skills";
 import {
   buildStablePrompt,
+  ESSENTIAL_CONSTRAINTS,
   loadAgentsInstructions,
   makeEditTool,
   makeReadTool,
   ToolRegistry,
   type WorkspacePolicy,
 } from "@kepler/kernel";
-import { detectPlatformSandbox, SandboxUnavailableError } from "@kepler/sandbox";
+import {
+  createUnsafePlatformExecution,
+  detectPlatformSandbox,
+  SandboxUnavailableError,
+} from "@kepler/sandbox";
 import type { ThinkingLevel } from "@kepler/protocol";
 
 import { KeplerApp } from "./app.ts";
@@ -47,6 +52,7 @@ interface CliArguments {
   thinking: ThinkingLevel;
   theme?: string;
   cwd: string;
+  unsafe: boolean;
 }
 
 function parseArguments(argv: readonly string[]): CliArguments {
@@ -54,6 +60,7 @@ function parseArguments(argv: readonly string[]): CliArguments {
     model: "gpt-5",
     thinking: "medium",
     cwd: process.cwd(),
+    unsafe: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index] as string;
@@ -68,6 +75,7 @@ function parseArguments(argv: readonly string[]): CliArguments {
     else if (argument === "--thinking") parsed.thinking = next() as ThinkingLevel;
     else if (argument === "--cwd") parsed.cwd = next();
     else if (argument === "--theme") parsed.theme = next();
+    else if (argument === "--unsafe") parsed.unsafe = true;
     else if (argument === "login" || argument === "daemon") parsed.command = argument;
     else if (!argument.startsWith("-")) parsed.sessionId = argument;
     else throw new Error(`Unknown argument ${argument}`);
@@ -110,23 +118,24 @@ function thinkingPayload(config: ActiveConfig) {
   return clampThinkingLevel(model, config.thinkingLevel);
 }
 
-/** The local-mode runtime: Azure OpenAI plus the sandboxed canonical tools over this cwd. */
+/** The local runtime. Operating-system isolation is skipped only after explicit `--unsafe`. */
 async function makeLocalDaemon(
   keplerHome: string,
+  stateDirectory: string,
   socketPath: string,
   defaults: ActiveConfig,
   store: FileCredentialStore,
+  unsafe: boolean,
 ) {
-  // failIfUnavailable: without a working sandbox the daemon does not start.
-  // Bubblewrap on Linux, Seatbelt on macOS; nothing runs unsandboxed.
-  const sandbox = await detectPlatformSandbox();
+  const sandbox = unsafe ? createUnsafePlatformExecution() : await detectPlatformSandbox();
   if (!sandbox.available) {
     throw new SandboxUnavailableError(sandbox.reason ?? "unknown");
   }
   const provider = createAzureOpenAiProvider({ store, context: nodeAuthContext });
   const daemon = new KeplerDaemon({
     socketPath,
-    dataDirectory: keplerHome,
+    dataDirectory: stateDirectory,
+    securityMode: unsafe ? "unsafe" : "sandboxed",
     runtime: async ({ sessionId, cwd, boundary, selection, interact }) => {
       // Resolve once here so the session log can redact every secret value.
       const resolved = await resolveProviderAuth(
@@ -142,21 +151,20 @@ async function makeLocalDaemon(
       if (!AZURE_OPENAI_MODELS.some((model) => model.modelId === active.modelId)) {
         throw new Error(`Unknown Azure OpenAI model ${active.modelId}`);
       }
-      const policy: WorkspacePolicy = { workspace: cwd, protectedPaths: [keplerHome] };
+      const policy: WorkspacePolicy = {
+        workspace: cwd,
+        readableRoots: [cwd],
+        protectedPaths: [keplerHome],
+      };
       const model = modelPortForSession(provider, {
         modelId: active.modelId,
         thinkingLevel: thinkingPayload(active).effective,
       });
       const tools = new ToolRegistry();
-      tools.register(
-        sandbox.makeShellTool({
-          cwd,
-          overflowDirectory: join(keplerHome, "tool-output"),
-          policy,
-        }),
-      );
-      tools.register(makeReadTool({ cwd, policy }));
-      tools.register(makeEditTool({ cwd, policy }));
+      const overflowDirectory = join(stateDirectory, "tool-output");
+      tools.register(sandbox.makeShellTool({ cwd, overflowDirectory, policy }));
+      tools.register(makeReadTool({ cwd, ...(unsafe ? {} : { policy }) }));
+      tools.register(makeEditTool({ cwd, ...(unsafe ? {} : { policy }) }));
 
       const skills = await discoverSkills({
         cwd,
@@ -173,8 +181,8 @@ async function makeLocalDaemon(
               servers: mcpServers,
               cwd,
               sessionId,
-              stateDirectory: join(keplerHome, "mcp"),
-              blobDirectory: join(keplerHome, "blobs"),
+              stateDirectory: join(stateDirectory, "mcp"),
+              blobDirectory: join(stateDirectory, "blobs"),
               model,
               modelId: active.modelId,
               secretValues: mcpSecrets,
@@ -187,6 +195,14 @@ async function makeLocalDaemon(
       const prompt = buildStablePrompt({
         cwd,
         tools: tools.declarations().map(({ name, description }) => ({ name, description })),
+        ...(unsafe
+          ? {
+              constraints: [
+                ...ESSENTIAL_CONSTRAINTS,
+                "No operating-system sandbox is active. Commands and file tools have the user's full host access.",
+              ],
+            }
+          : {}),
         instructions: [
           ...(await loadAgentsInstructions({
             cwd,
@@ -220,14 +236,38 @@ async function makeLocalDaemon(
   return daemon;
 }
 
+class SecurityModeMismatchError extends Error {
+  constructor(requested: "sandboxed" | "unsafe", actual: string) {
+    super(`Daemon security mode is ${actual}; ${requested} was requested`);
+    this.name = "SecurityModeMismatchError";
+  }
+}
+
+async function connectExpectedDaemon(socketPath: string, unsafe: boolean): Promise<DaemonClient> {
+  const client = await DaemonClient.connect(socketPath);
+  try {
+    const info = (await client.request("daemon.info", {})) as { securityMode?: string };
+    const expected = unsafe ? "unsafe" : "sandboxed";
+    if (info.securityMode !== expected) {
+      throw new SecurityModeMismatchError(expected, info.securityMode ?? "unknown");
+    }
+    return client;
+  } catch (error) {
+    client.close();
+    throw error;
+  }
+}
+
 async function connectOrStartDaemon(input: {
   readonly socketPath: string;
   readonly model: string;
   readonly thinking: ThinkingLevel;
+  readonly unsafe: boolean;
 }): Promise<DaemonClient> {
   try {
-    return await DaemonClient.connect(input.socketPath);
-  } catch {
+    return await connectExpectedDaemon(input.socketPath, input.unsafe);
+  } catch (error) {
+    if (error instanceof SecurityModeMismatchError) throw error;
     const entry = process.argv[1];
     if (entry === undefined) throw new Error("Cannot locate the Kepler executable");
     const child = spawn(
@@ -242,6 +282,7 @@ async function connectOrStartDaemon(input: {
         input.model,
         "--thinking",
         input.thinking,
+        ...(input.unsafe ? ["--unsafe"] : []),
       ],
       { detached: true, stdio: "ignore" },
     );
@@ -252,7 +293,7 @@ async function connectOrStartDaemon(input: {
   let lastError: unknown;
   while (Date.now() < deadline) {
     try {
-      return await DaemonClient.connect(input.socketPath);
+      return await connectExpectedDaemon(input.socketPath, input.unsafe);
     } catch (error) {
       lastError = error;
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
@@ -264,8 +305,9 @@ async function connectOrStartDaemon(input: {
 async function main(): Promise<void> {
   const cli = parseArguments(process.argv.slice(2));
   const keplerHome = join(homedir(), ".kepler");
-  await mkdir(keplerHome, { recursive: true, mode: 0o700 });
-  const socketPath = cli.socket ?? join(keplerHome, "kepler.sock");
+  const stateDirectory = cli.unsafe ? join(keplerHome, "unsafe") : keplerHome;
+  await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+  const socketPath = cli.socket ?? join(stateDirectory, "kepler.sock");
   const store = new FileCredentialStore(join(keplerHome, "credentials.json"));
 
   if (cli.command === "login") {
@@ -276,7 +318,19 @@ async function main(): Promise<void> {
   const active: ActiveConfig = { modelId: cli.model, thinkingLevel: cli.thinking };
   if (cli.command === "daemon") {
     await ensureCredentials(store);
-    const daemon = await makeLocalDaemon(keplerHome, socketPath, active, store);
+    if (cli.unsafe) {
+      process.stderr.write(
+        "WARNING: --unsafe disables operating-system isolation and gives tools full host access.\n",
+      );
+    }
+    const daemon = await makeLocalDaemon(
+      keplerHome,
+      stateDirectory,
+      socketPath,
+      active,
+      store,
+      cli.unsafe,
+    );
     const stop = (): void => {
       void daemon.stop().finally(() => process.exit(0));
     };
@@ -288,13 +342,15 @@ async function main(): Promise<void> {
 
   let client: DaemonClient;
   try {
-    client = await DaemonClient.connect(socketPath);
-  } catch {
+    client = await connectExpectedDaemon(socketPath, cli.unsafe);
+  } catch (error) {
+    if (error instanceof SecurityModeMismatchError) throw error;
     await ensureCredentials(store);
     client = await connectOrStartDaemon({
       socketPath,
       model: active.modelId,
       thinking: active.thinkingLevel,
+      unsafe: cli.unsafe,
     });
   }
 

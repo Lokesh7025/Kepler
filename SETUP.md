@@ -49,6 +49,19 @@ kepler <session-id>
 
 The client uses `~/.kepler/kepler.sock`. It starts a detached local daemon when one is not already running. Use `kepler daemon` to keep the daemon in the foreground for troubleshooting. Restart an existing daemon after changing exported environment variables because a running process cannot inherit later shell changes.
 
+## Unsafe mode
+
+Use `--unsafe` only when you explicitly need to run without operating-system confinement:
+
+```bash
+kepler --unsafe
+kepler daemon --unsafe
+```
+
+This disables Bubblewrap or Seatbelt and removes file-tool path restrictions. Shell commands, reads, edits, and local stdio MCP servers receive the user's full host authority. The TUI displays a persistent warning, and the canonical log records `sandbox.configured` with `enforced: false`.
+
+Unsafe mode uses a separate daemon socket and session directory under `~/.kepler/unsafe/`. This prevents a normal client from silently attaching to an unsafe daemon. Provider credentials remain in the normal credential store.
+
 ## Add Agent Skills
 
 Put skills in either location:

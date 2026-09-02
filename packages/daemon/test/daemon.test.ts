@@ -56,6 +56,7 @@ function hangingPort(): ModelPort {
 async function startDaemon(
   context: TestContext,
   port: ModelPort = replyPort(),
+  securityMode: "sandboxed" | "unsafe" = "sandboxed",
 ): Promise<{ daemon: KeplerDaemon; socketPath: string; dataDirectory: string; cwd: string }> {
   const directory = await mkdtemp(join(tmpdir(), "kepler-daemon-"));
   context.after(() => rm(directory, { recursive: true, force: true }));
@@ -63,6 +64,7 @@ async function startDaemon(
   const daemon = new KeplerDaemon({
     socketPath,
     dataDirectory: join(directory, "data"),
+    securityMode,
     runtime: () => ({ model: port, tools: new ToolRegistry(), system: "You are Kepler." }),
   });
   await daemon.start();
@@ -73,6 +75,20 @@ async function startDaemon(
 function types(events: readonly CanonicalEvent[]): readonly string[] {
   return events.map((event) => event.type);
 }
+
+test("reports the daemon security mode", async (context) => {
+  const sandboxed = await startDaemon(context);
+  const sandboxedClient = await DaemonClient.connect(sandboxed.socketPath);
+  context.after(() => sandboxedClient.close());
+  assert.deepEqual(await sandboxedClient.request("daemon.info", {}), {
+    securityMode: "sandboxed",
+  });
+
+  const unsafe = await startDaemon(context, replyPort(), "unsafe");
+  const unsafeClient = await DaemonClient.connect(unsafe.socketPath);
+  context.after(() => unsafeClient.close());
+  assert.deepEqual(await unsafeClient.request("daemon.info", {}), { securityMode: "unsafe" });
+});
 
 test("creates a session, streams the live tail, and answers sends", async (context) => {
   const { socketPath, cwd } = await startDaemon(context);

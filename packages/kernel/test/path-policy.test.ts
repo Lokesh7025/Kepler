@@ -40,7 +40,7 @@ async function makeLayout(context: TestContext): Promise<{
     workspace,
     outside,
     keplerHome,
-    policy: { workspace, protectedPaths: [keplerHome] },
+    policy: { workspace, readableRoots: [workspace], protectedPaths: [keplerHome] },
   };
 }
 
@@ -74,16 +74,36 @@ test("writes outside the workspace and symlink escapes are rejected", async (con
   );
 });
 
-test("protected paths are unreadable and unwritable", async (context) => {
-  const { keplerHome, outside, policy } = await makeLayout(context);
+test("reads require an explicit root and protected paths still win", async (context) => {
+  const { workspace, keplerHome, outside, policy } = await makeLayout(context);
   await assert.rejects(
     assertReadAllowed(policy, join(keplerHome, "credentials.json")),
     (error) => error instanceof SandboxViolationError && error.capability === "filesystem.read",
   );
-  // Reads outside the workspace but outside protected paths are allowed.
+  await assert.rejects(
+    assertReadAllowed(policy, join(outside, "victim.txt")),
+    (error) => error instanceof SandboxViolationError && error.capability === "filesystem.read",
+  );
+  assert.equal(
+    await assertReadAllowed(policy, join(workspace, "inside.txt")),
+    join(workspace, "inside.txt"),
+  );
+});
+
+test("an explicitly readable root remains read-only", async (context) => {
+  const { workspace, outside, keplerHome } = await makeLayout(context);
+  const policy: WorkspacePolicy = {
+    workspace,
+    readableRoots: [workspace, outside],
+    protectedPaths: [keplerHome],
+  };
   assert.equal(
     await assertReadAllowed(policy, join(outside, "victim.txt")),
     join(outside, "victim.txt"),
+  );
+  await assert.rejects(
+    assertWriteAllowed(policy, join(outside, "victim.txt")),
+    (error) => error instanceof SandboxViolationError && error.capability === "filesystem.write",
   );
 });
 
@@ -95,6 +115,10 @@ test("read and edit tools enforce the policy before touching the filesystem", as
 
   await assert.rejects(
     read.execute({ path: join(keplerHome, "credentials.json") }, signal),
+    SandboxViolationError,
+  );
+  await assert.rejects(
+    read.execute({ path: join(outside, "victim.txt") }, signal),
     SandboxViolationError,
   );
   await assert.rejects(

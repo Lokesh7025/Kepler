@@ -10,7 +10,7 @@ import test, { type TestContext } from "node:test";
 
 import { KeplerDaemon, DaemonClient, type SessionInteractionRequest } from "@kepler/daemon";
 import { type ModelPort, ToolRegistry } from "@kepler/kernel";
-import type { JsonObject, ModelStreamEvent, Usage } from "@kepler/protocol";
+import type { EventPayloadMap, JsonObject, ModelStreamEvent, Usage } from "@kepler/protocol";
 
 import { KeplerApp } from "../src/index.ts";
 
@@ -37,6 +37,7 @@ async function startStack(
       content?: JsonObject;
     }>,
   ) => ToolRegistry = () => new ToolRegistry(),
+  sandbox?: EventPayloadMap["sandbox.configured"],
 ) {
   const directory = await mkdtemp(join(tmpdir(), "kepler-tui-"));
   context.after(() => rm(directory, { recursive: true, force: true }));
@@ -48,6 +49,7 @@ async function startStack(
       model,
       tools: makeTools(interact),
       system: "You are Kepler.",
+      ...(sandbox === undefined ? {} : { sandbox }),
       ...(selection.modelId === undefined ? {} : { configModel: { modelId: selection.modelId } }),
       ...(selection.thinkingLevel === undefined
         ? {}
@@ -136,6 +138,33 @@ test("a full round trip: type, send, render the reply, detach, resume", async (c
   assert.match(resumed.text(), /│ hello kepler/);
   assert.match(resumed.text(), /the answer/);
   resumedApp.stop();
+});
+
+test("an unenforced session keeps a persistent unsafe warning", async (context) => {
+  const { socketPath, directory } = await startStack(context, port, undefined, {
+    provider: "none",
+    enforced: false,
+    controls: [],
+  });
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  const app = await KeplerApp.start({
+    client: await DaemonClient.connect(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+  });
+  const warning = "UNSAFE: no sandbox; tools have full host access";
+  assert.match(text(), new RegExp(warning));
+  input.write("/theme\r");
+  await until(() => text().includes("Select theme"), "unsafe theme dialog");
+  assert.match(text(), new RegExp(warning));
+  input.write("\x1b");
+  input.write("hello\r");
+  await until(() => text().includes("the answer"), "unsafe assistant reply");
+  assert.match(text(), new RegExp(warning));
+  app.stop();
 });
 
 test("editing, /quit, and busy notices behave", async (context) => {
